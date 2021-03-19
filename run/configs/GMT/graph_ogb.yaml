@@ -1,0 +1,37 @@
+out_dir: results
+dataset:
+  format: OGB
+  name: ogbg-molhiv
+  task: graph
+  task_type: classification
+  transductive: False
+  split: [0.8, 0.2, 0.0]
+  augment_feature: []
+  augment_feature_dims: [10]
+  augment_feature_repr: original
+  augment_label: ''
+  augment_label_dims: 10
+  transform: none
+  node_encoder: True
+  node_encoder_name: 'SingleAtom'
+  node_encoder_bn: True
+train:
+  batch_size: 64
+  eval_period: 1
+  ckpt_period: 100
+model:
+  type: gmt
+  loss_fun: cross_entropy
+gmt:
+  heads: 4
+  seeds: 10
+  convs: 3
+  dropout: 0.1
+  embed: 128
+  model_type: GCN
+  output_layers: 3
+optim:
+  optimizer: adam
+  scheduler: none
+  base_lr: 0.001
+  max_epoch: 100

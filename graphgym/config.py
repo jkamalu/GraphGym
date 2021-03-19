@@ -317,6 +317,25 @@ def set_cfg(cfg):
     cfg.gnn.keep_edge = 0.5
 
     # ------------------------------------------------------------------------ #
+    # GMT options (temporary)
+    # ------------------------------------------------------------------------ #
+    cfg.gmt = CN()
+    
+    cfg.gmt.heads = 4
+
+    cfg.gmt.seeds = 10
+
+    cfg.gmt.convs = 3
+    
+    cfg.gmt.dropout = 0.1
+    
+    cfg.gmt.embed = 128
+
+    cfg.gmt.model_type = "GCN"
+    
+    cfg.gmt.output_layers = 3
+
+    # ------------------------------------------------------------------------ #
     # Optimizer options
     # ------------------------------------------------------------------------ #
     cfg.optim = CN()
