@@ -4,10 +4,11 @@ import torch.nn.functional as F
 from torch.nn.modules.linear import _LinearWithBias
 
 import torch_geometric.nn as pyg_nn
+from torch_geometric.utils import to_dense_batch
 
 from graphgym.config import cfg
-from graphgym.models.layer import MLP, BatchNorm1dNode
-from graphgym.models.feature_encoder import node_encoder_dict
+from graphgym.models.layer import MLP, BatchNorm1dNode, BatchNorm1dEdge
+from graphgym.models.feature_encoder import node_encoder_dict, edge_encoder_dict
 from graphgym.register import register_network
 
 
@@ -37,11 +38,11 @@ class GMTLayer(nn.Module):
         self.layer_norm_z = nn.LayerNorm(dim_embed)
         self.feed_forward = nn.Linear(dim_embed, dim_embed) # use in row-wise fashion
 
-    def multi_head_attention(self, x, edge_index):
+    def multi_head_attention(self, x_dense, graph=None):
         raise NotImplementedError
 
-    def forward(self, x, edge_index=None):
-        query, attention_output = self.multi_head_attention(x, edge_index)
+    def forward(self, x_dense, graph=None):
+        query, attention_output = self.multi_head_attention(x_dense, graph)
         embed = self.layer_norm_h(query + attention_output)
         embed = self.layer_norm_z(embed + self.feed_forward(embed))
         return embed
@@ -54,36 +55,57 @@ class GMTConvAttention(GMTLayer):
         self.num_seeds = kwargs['num_seeds']
         self.model_type = kwargs['model_type']
 
-        self.seed = nn.Parameter(torch.empty(self.num_seeds, self.dim_embed))
+        self.seed = nn.Parameter(torch.empty(self.num_seeds, 1, self.dim_embed))
 
-        conv = conv_lookup(self.model_type)
-        self.convs_k = nn.ModuleList([
-            conv(self.dim_embed, self.dim_heads) for _ in range(self.num_heads)
-        ])
-        self.convs_v = nn.ModuleList([
-            conv(self.dim_embed, self.dim_heads) for _ in range(self.num_heads)
-        ])
-        
+        if self.num_seeds > 1:
+            conv = conv_lookup(self.model_type)
+            self.convs_k = nn.ModuleList([
+                conv(self.dim_embed, self.dim_heads) for _ in range(self.num_heads)
+            ])
+            self.convs_v = nn.ModuleList([
+                conv(self.dim_embed, self.dim_heads) for _ in range(self.num_heads)
+            ])
+        else:
+            self.convs_k = nn.ModuleList([nn.Linear(self.dim_embed, self.dim_embed)])
+            self.convs_v = nn.ModuleList([nn.Linear(self.dim_embed, self.dim_embed)])
+
         self.q_proj_weight = nn.Parameter(torch.empty(self.dim_embed, self.dim_embed))
         self.out_proj = _LinearWithBias(self.dim_embed, self.dim_embed)
+        
+        nn.init.xavier_uniform_(self.seed)
+        nn.init.xavier_uniform_(self.q_proj_weight)
 
-    def multi_head_attention(self, x, edge_index):
-        query = self.seed.unsqueeze(1)
-        static_k = torch.cat([conv(x, edge_index).unsqueeze(0) for conv in self.convs_k], dim=0) # (N*num_heads, N, E/num_heads)
-        static_v = torch.cat([conv(x, edge_index).unsqueeze(0) for conv in self.convs_v], dim=0) # (N*num_heads, N, E/num_heads)
+    def multi_head_attention(self, x_dense, graph=None):
+        query = self.seed.repeat(1, x_dense.shape[0], 1)
+        
+        if graph is not None:
+            x, edge_index, batch = graph
+            static_k = torch.cat([conv(x, edge_index) for conv in self.convs_k], dim=1)
+            static_v = torch.cat([conv(x, edge_index) for conv in self.convs_v], dim=1)
+            static_k, _ = to_dense_batch(static_k, batch)
+            static_v, _ = to_dense_batch(static_v, batch)
+        else:
+            static_k = torch.cat([conv(x_dense) for conv in self.convs_k], dim=1)
+            static_v = torch.cat([conv(x_dense) for conv in self.convs_v], dim=1)
+        
+        # reshape for torch.nn.functional
+        shape = (x_dense.shape[0] * self.num_heads, self.dim_embed // self.num_heads, -1)
+        static_k = static_k.transpose(1, 2).contiguous().view(*shape).transpose(1, 2)
+        static_v = static_v.transpose(1, 2).contiguous().view(*shape).transpose(1, 2)
 
+        # requires modification to torch.nn.functional
         output, weights = F.multi_head_attention_forward(
             query,
-            None,
-            None,
+            None, # TODO
+            None, # TODO
             self.dim_embed,
             self.num_heads,
-            None,
-            None,
-            None,
-            None,
-            False,
-            self.dropout,
+            in_proj_weight=None, 
+            in_proj_bias=None,
+            bias_k=None,
+            bias_v=None,
+            add_zero_attn=False,
+            dropout_p=self.dropout,
             out_proj_weight=self.out_proj.weight,
             out_proj_bias=self.out_proj.bias,
             training=self.training,
@@ -92,8 +114,8 @@ class GMTConvAttention(GMTLayer):
             static_k=static_k,
             static_v=static_v
         )
-        
-        return self.seed, output.squeeze()
+
+        return query.transpose(0, 1), output.transpose(0, 1)
 
 
 class GMTSelfAttention(GMTLayer):
@@ -102,9 +124,9 @@ class GMTSelfAttention(GMTLayer):
         super(GMTSelfAttention, self).__init__(*args, **kwargs)
         self.MHA = nn.MultiheadAttention(self.dim_embed, self.num_heads, dropout=self.dropout)
 
-    def multi_head_attention(self, x, edge_index=None):
-        output, weights = self.MHA(x.unsqueeze(1), x.unsqueeze(1), x.unsqueeze(1))
-        return x, output.squeeze()
+    def multi_head_attention(self, x, graph):
+        output, weights = self.MHA(x.transpose(0, 1), x.transpose(0, 1), x.transpose(0, 1))
+        return x, output.transpose(0, 1)
 
 
 class GraphMultisetTransformerGNN(nn.Module):
@@ -118,8 +140,6 @@ class GraphMultisetTransformerGNN(nn.Module):
         self.dropout = cfg.gmt.dropout
         self.model_type = cfg.gmt.model_type
         self.output_layers = cfg.gmt.output_layers
-        
-        assert cfg.dataset.transform != 'ego'
 
         if cfg.dataset.node_encoder:
             NodeEncoder = node_encoder_dict[cfg.dataset.node_encoder_name]
@@ -127,6 +147,11 @@ class GraphMultisetTransformerGNN(nn.Module):
             if cfg.dataset.node_encoder_bn:
                 self.node_encoder_bn = BatchNorm1dNode(cfg.dataset.encoder_dim)
             dim_in = cfg.dataset.encoder_dim
+        if cfg.dataset.edge_encoder:
+            EdgeEncoder = edge_encoder_dict[cfg.dataset.edge_encoder_name]
+            self.edge_encoder = EdgeEncoder(cfg.dataset.encoder_dim)
+            if cfg.dataset.edge_encoder_bn:
+                self.edge_encoder_bn = BatchNorm1dEdge(cfg.dataset.edge_dim)
 
         conv = conv_lookup(self.model_type)
         self.convs = nn.ModuleList(
@@ -140,29 +165,36 @@ class GraphMultisetTransformerGNN(nn.Module):
         self.attn_2 = GMTSelfAttention(
             self.dim_embed, self.num_heads, dropout=self.dropout)
         self.attn_3 = GMTConvAttention(
-            self.dim_embed, self.num_heads, self.dropout, num_seeds=1, model_type=self.model_type)
+            self.dim_embed, self.num_heads, self.dropout, num_seeds=1, model_type=None)
 
-        self.head = nn.Linear(self.dim_embed, dim_out)
+        self.head = nn.Sequential(
+            nn.Linear(self.dim_embed, self.dim_embed),
+            nn.Linear(self.dim_embed, dim_out)
+        )
 
     def forward(self, batch):
-        print(dir(batch))
         batch = self.node_encoder_bn(self.node_encoder(batch))
-        print(batch.batch)
+        batch = self.edge_encoder_bn(self.edge_encoder(batch))
         
         x, edge_index, x_batch = batch.node_feature, batch.edge_index, batch.batch
-
+        
         for i in range(len(self.convs)):
             x = self.convs[i](x, edge_index)
             x = F.relu(x)
             x = F.dropout(x, p=self.dropout, training=self.training)
+                
+        # x_dense = pyg_nn.global_add_pool(x, x_batch)
 
-        x = self.attn_1(x, edge_index)
-        x = self.attn_2(x)
-        x = self.attn_3(x, torch.arange(self.num_seeds).long().unsqueeze(0).repeat(2, 1).to(x.device))
+        x_dense, mask = to_dense_batch(x, x_batch)
+
+        x_dense = self.attn_1(x_dense, graph=(x, edge_index, x_batch))
         
-        batch.node_feature = x
-        batch.graph_feature = torch.sigmoid(self.head(x))
+        x_dense = self.attn_2(x_dense)
         
+        x_dense = self.attn_3(x_dense, graph=None)
+        
+        batch.graph_feature = self.head(x_dense).squeeze()
+    
         return batch.graph_feature, batch.graph_label
 
 

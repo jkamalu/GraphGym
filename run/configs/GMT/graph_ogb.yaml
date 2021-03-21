@@ -15,16 +15,20 @@ dataset:
   node_encoder: True
   node_encoder_name: 'SingleAtom'
   node_encoder_bn: True
+  edge_encoder: True
+  edge_encoder_name: 'Bond'
+  edge_encoder_bn: True
+  edge_dim: 128
 train:
-  batch_size: 64
+  batch_size: 512
   eval_period: 1
   ckpt_period: 100
 model:
   type: gmt
   loss_fun: cross_entropy
 gmt:
-  heads: 4
-  seeds: 10
+  heads: 2
+  seeds: 4
   convs: 3
   dropout: 0.1
   embed: 128
